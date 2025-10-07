@@ -99,9 +99,12 @@ struct WSPayload: Codable {
 struct ToolCall: Codable {
     struct Args: Codable {
         var query: String
-        var k: Int?
-        var summarize: Bool?
-        var preview_chars: Int?
+        var topK: Int?
+
+        enum CodingKeys: String, CodingKey {
+            case query
+            case topK = "top_k"
+        }
     }
     var tool: String
     var args: Args

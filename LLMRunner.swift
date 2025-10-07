@@ -51,8 +51,18 @@ final class LLMRunner: ObservableObject {
     private var lastUserEcho: String = ""
     private var didPruneUserEcho: Bool = false
     private var composeVisibleDraft: String = ""
+    private var lastMalformedToolCall: String?
+    private var searchDebugLog: [String] = []
+    private var searchFailureContext: SearchFailureContext?
 
-    private let toolSpec = "Use web_search for anything time-sensitive, 'latest', news, specs, products, errors."
+    private struct SearchFailureContext {
+        var query: String
+        var errorDescription: String
+        var stage: String?
+        var debugLines: [String]
+    }
+
+    private let toolSpec = "Use web_search for anything time-sensitive by emitting <tool_call>{\"tool\":\"web_search\",\"args\":{\"query\":\"...\",\"top_k\":5}}</tool_call>. Do not include any other keys in args."
     private let filter = StreamFilter()
     private var cancellables = Set<AnyCancellable>()
     private var mlxEngine: MLXEngine?
@@ -63,7 +73,6 @@ final class LLMRunner: ObservableObject {
     func generateWithToolsStreaming(
         prefs: AppPrefs,
         history: [ChatMessage],
-        forceSearchIfUserAsked: Bool,
         onEvent: @escaping (RunnerEvent) -> Void,
         completion: @escaping (Result<String, Error>) -> Void
     ) {
@@ -88,6 +97,9 @@ final class LLMRunner: ObservableObject {
         self.isSearching = false
         self.justCompletedMessageID = nil
         self.usedSearchThisAnswer = false
+        self.lastMalformedToolCall = nil
+        self.searchDebugLog.removeAll()
+        self.searchFailureContext = nil
         if let lastUser = history.last(where: { $0.role == .user }) {
             let normalized = lastUser.text
                 .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
@@ -123,24 +135,24 @@ final class LLMRunner: ObservableObject {
             case .failure(let err):
                 self.finish(.failure(err), prefs: prefs, completion: completion)
             case .success(let out1):
-                if let tool = self.extractToolCall(from: out1) ?? (forceSearchIfUserAsked ? self.makeToolCallFromUser(history: history) : nil),
-                   tool.tool == "web_search" {
+                let extraction = self.extractToolCall(from: out1)
+                if let tool = extraction.call, tool.tool == "web_search" {
                     onEvent(.toolStarted("web_search"))
                     self.statusLine = "Searching…"
                     self.isSearching = true
-                    self.usedSearchThisAnswer = true
+                    let topK = tool.args.topK ?? 5
                     WebSearchService.shared.web_search(
                         query: tool.args.query,
-                        k: tool.args.k ?? 5,
-                        summarize: tool.args.summarize ?? true,
-                        previewChars: tool.args.preview_chars ?? 2000,
+                        topK: topK,
                         progress: { ev in
                             DispatchQueue.main.async {
                                 switch ev {
                                 case let .opened(t, u, h):
-                                    self.visitedSites.append((t,u,h))
+                                    self.appendSearchDebug("opened: \(t) [\(h)]")
+                                    self.visitedSites.append((t, u, h))
                                     onEvent(.siteOpened(title: t, url: u, host: h))
                                 case .status(let s):
+                                    self.appendSearchDebug("status: \(s)")
                                     self.statusLine = s
                                     onEvent(.status(s))
                                 }
@@ -148,100 +160,100 @@ final class LLMRunner: ObservableObject {
                         },
                         completion: { wsResult in
                             DispatchQueue.main.async {
-                                if self.cancelled { self.finish(.failure(RunnerError.processFailed("Cancelled")), prefs: prefs, completion: completion); return }
+                                if self.cancelled {
+                                    self.finish(.failure(RunnerError.processFailed("Cancelled")), prefs: prefs, completion: completion)
+                                    return
+                                }
                                 switch wsResult {
                                 case .failure(let err):
                                     onEvent(.toolFinished("web_search"))
                                     self.statusLine = "Search failed"
                                     self.isSearching = false
-                                    // Show error banner using existing system (UI manages dismissal timing)
-                                    let msg: String
+                                    self.appendSearchDebug("error: \(err.localizedDescription)")
+                                    let stageName: String?
+                                    if let pipeline = err as? SearchPipelineError {
+                                        stageName = pipeline.stageName
+                                    } else {
+                                        stageName = nil
+                                    }
+                                    self.searchFailureContext = SearchFailureContext(
+                                        query: tool.args.query,
+                                        errorDescription: err.localizedDescription,
+                                        stage: stageName,
+                                        debugLines: self.searchDebugLog
+                                    )
+                                    var msg: String
+                                    let trace = self.compactSearchDebugLog()
                                     if prefs.showDetailedErrors {
-                                        msg = "Web search failed for query \"\(tool.args.query)\" (DuckDuckGo). Details: \(err.localizedDescription). Tips: check your internet connection or try again shortly. The assistant will continue without sources."
+                                        var detailed = "Web search failed for query \"\(tool.args.query)\". Details: \(err.localizedDescription)."
+                                        if let stageName {
+                                            detailed += " Stage: \(stageName)."
+                                        }
+                                        if !trace.isEmpty {
+                                            detailed += " Debug trace: \(trace)."
+                                        }
+                                        detailed += " Tips: check your internet connection or try again shortly. The assistant will continue without sources."
+                                        msg = detailed
                                     } else {
                                         msg = "Web search failed. Continuing without sources."
                                     }
                                     self.lastError = msg
-                                    // Continue anyway; model will admit insufficiency
-                                    // Reset visible stream for second pass to avoid mixing partial text
                                     self.visibleStreamRaw = ""; self.streamingVisible = ""; self.streamedToolCallAccum = ""
+                                    let callJSON = self.canonicalToolCallJSON(query: tool.args.query, topK: topK)
+                                    let failureJSON = self.encodeSearchFailureResult(
+                                        query: tool.args.query,
+                                        topK: topK,
+                                        errorDescription: err.localizedDescription,
+                                        stage: stageName,
+                                        debug: self.searchDebugLog
+                                    )
                                     let extendedRaw = trimmed + [
-                                        ChatMessage(role: .assistant, text: "<tool_call>{\"tool\":\"web_search\",\"args\":{\"query\":\"\(tool.args.query)\"}}</tool_call>"),
-                                        ChatMessage(role: .assistant, text: "<tool_result name=\"web_search\">{\"ok\":false,\"query\":\"\(tool.args.query)\",\"source\":\"error\",\"results\":[],\"previews\":[],\"summaries\":[],\"summarized\":false}</tool_result>")
+                                        ChatMessage(role: .assistant, text: "<tool_call>\(callJSON)</tool_call>"),
+                                        ChatMessage(role: .assistant, text: "<tool_result name=\"web_search\">\(failureJSON)</tool_result>")
                                     ]
                                     let extended = self.trimHistoryToBudget(prefs: prefs, reasoning: prefs.reasoningEffort, toolSpec: self.toolSpec, history: extendedRaw)
                                     self.secondPass(prefs: prefs, extendedHistory: extended, onEvent: onEvent, completion: completion)
                                 case .success(let payload):
                                     onEvent(.toolFinished("web_search"))
                                     self.isSearching = false
-                                    let encoded = self.encodeSearchPayloadCompacted(payload)
-                                    // Reset visible stream for second pass to avoid mixing partial text
+                                    self.usedSearchThisAnswer = true
+                                    var enriched = payload
+                                    let trace = self.compactSearchDebugLog()
+                                    if !trace.isEmpty {
+                                        if enriched.debug != nil {
+                                            enriched.debug?["trace"] = trace
+                                        } else {
+                                            enriched.debug = ["trace": trace]
+                                        }
+                                    }
+                                    let encoded = self.encodeSearchPayloadCompacted(enriched)
                                     self.visibleStreamRaw = ""; self.streamingVisible = ""; self.streamedToolCallAccum = ""
+                                    let callJSON = self.canonicalToolCallJSON(query: tool.args.query, topK: topK)
                                     let extendedRaw = trimmed + [
-                                        ChatMessage(role: .assistant, text: "<tool_call>{\"tool\":\"web_search\",\"args\":{\"query\":\"\(tool.args.query)\",\"k\":\(tool.args.k ?? 5),\"summarize\":true,\"preview_chars\":\(tool.args.preview_chars ?? 2000)}}</tool_call>"),
+                                        ChatMessage(role: .assistant, text: "<tool_call>\(callJSON)</tool_call>"),
                                         ChatMessage(role: .assistant, text: "<tool_result name=\"web_search\">\(encoded)</tool_result>")
                                     ]
+                                    self.searchFailureContext = nil
                                     let extended = self.trimHistoryToBudget(prefs: prefs, reasoning: prefs.reasoningEffort, toolSpec: self.toolSpec, history: extendedRaw)
                                     self.secondPass(prefs: prefs, extendedHistory: extended, onEvent: onEvent, completion: completion)
                                 }
                             }
                         }
                     )
-                } else if out1.range(of: "<tool_call", options: .caseInsensitive) != nil || out1.range(of: "web_search", options: .caseInsensitive) != nil {
-                    // Heuristic fallback: model attempted a tool call but JSON was malformed
-                    onEvent(.toolStarted("web_search"))
-                    self.statusLine = "Searching…"
-                    self.isSearching = true
-                    self.usedSearchThisAnswer = true
-                    let lastUserQ = history.last(where: { $0.role == .user })?.text ?? ""
-                    let fallback = self.makeToolCallFromUser(history: history) ?? ToolCall(tool: "web_search", args: .init(query: lastUserQ, k: 5, summarize: true, preview_chars: 2000))
-                    WebSearchService.shared.web_search(
-                        query: fallback.args.query,
-                        k: fallback.args.k ?? 5,
-                        summarize: fallback.args.summarize ?? true,
-                        previewChars: fallback.args.preview_chars ?? 2000,
-                        progress: { ev in
-                            DispatchQueue.main.async {
-                                switch ev {
-                                case let .opened(t, u, h):
-                                    self.visitedSites.append((t,u,h))
-                                    onEvent(.siteOpened(title: t, url: u, host: h))
-                                case .status(let s):
-                                    self.statusLine = s
-                                    onEvent(.status(s))
-                                }
-                            }
-                        },
-                        completion: { wsResult in
-                            DispatchQueue.main.async {
-                                if self.cancelled { self.finish(.failure(RunnerError.processFailed("Cancelled")), prefs: prefs, completion: completion); return }
-                                switch wsResult {
-                                case .failure:
-                                    onEvent(.toolFinished("web_search"))
-                                    self.isSearching = false
-                                    // Continue without sources
-                                    self.visibleStreamRaw = ""; self.streamingVisible = ""; self.streamedToolCallAccum = ""
-                                    let extendedRaw = trimmed + [
-                                        ChatMessage(role: .assistant, text: "<tool_call>{\"tool\":\"web_search\",\"args\":{\"query\":\"\(fallback.args.query)\"}}</tool_call>"),
-                                        ChatMessage(role: .assistant, text: "<tool_result name=\"web_search\">{\"ok\":false,\"query\":\"\(fallback.args.query)\",\"source\":\"error\",\"results\":[],\"previews\":[],\"summaries\":[],\"summarized\":false}</tool_result>")
-                                    ]
-                                    let extended = self.trimHistoryToBudget(prefs: prefs, reasoning: prefs.reasoningEffort, toolSpec: self.toolSpec, history: extendedRaw)
-                                    self.secondPass(prefs: prefs, extendedHistory: extended, onEvent: onEvent, completion: completion)
-                                case .success(let payload):
-                                    onEvent(.toolFinished("web_search"))
-                                    self.isSearching = false
-                                    let encoded = self.encodeSearchPayloadCompacted(payload)
-                                    self.visibleStreamRaw = ""; self.streamingVisible = ""; self.streamedToolCallAccum = ""
-                                    let extendedRaw = trimmed + [
-                                        ChatMessage(role: .assistant, text: "<tool_call>{\"tool\":\"web_search\",\"args\":{\"query\":\"\(fallback.args.query)\",\"k\":\(fallback.args.k ?? 5),\"summarize\":true,\"preview_chars\":\(fallback.args.preview_chars ?? 2000)}}</tool_call>"),
-                                        ChatMessage(role: .assistant, text: "<tool_result name=\"web_search\">\(encoded)</tool_result>")
-                                    ]
-                                    let extended = self.trimHistoryToBudget(prefs: prefs, reasoning: prefs.reasoningEffort, toolSpec: self.toolSpec, history: extendedRaw)
-                                    self.secondPass(prefs: prefs, extendedHistory: extended, onEvent: onEvent, completion: completion)
-                                }
-                            }
-                        }
-                    )
+                } else if let malformed = extraction.malformed {
+                    self.lastMalformedToolCall = malformed
+                    self.statusLine = "Tool call malformed."
+                    onEvent(.status("Tool call malformed."))
+                    self.isSearching = false
+                    self.visibleStreamRaw = ""; self.streamingVisible = ""; self.streamedToolCallAccum = ""
+                    let queryHint = self.normalizeQueryHint(extraction.inferredQuery ?? self.fallbackQuery(from: history))
+                    let canonical = self.canonicalToolCallJSON(query: queryHint, topK: 5)
+                    let payload = self.encodeMalformedToolResult(received: malformed, canonical: canonical)
+                    let extendedRaw = trimmed + [
+                        ChatMessage(role: .assistant, text: "<tool_result name=\"web_search\">\(payload)</tool_result>")
+                    ]
+                    let extended = self.trimHistoryToBudget(prefs: prefs, reasoning: prefs.reasoningEffort, toolSpec: self.toolSpec, history: extendedRaw)
+                    self.secondPass(prefs: prefs, extendedHistory: extended, onEvent: onEvent, completion: completion)
                 } else {
                     // No tool call → treat out1 as the answer
                     self.isSearching = false
@@ -289,6 +301,12 @@ final class LLMRunner: ObservableObject {
                     if !fallback.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                         cleaned = fallback
                     }
+                }
+                if cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, let context = self.searchFailureContext {
+                    let fallback = self.fallbackVisibleForSearchFailure(context: context, prefs: prefs)
+                    self.searchFailureContext = nil
+                    self.finish(.success(fallback), prefs: prefs, completion: completion)
+                    return
                 }
                 guard !cleaned.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                     self.finish(.failure(RunnerError.outputEmpty), prefs: prefs, completion: completion); return
@@ -558,73 +576,162 @@ final class LLMRunner: ObservableObject {
     }
 
     // MARK: Tool helpers
-    private func extractToolCall(from text: String) -> ToolCall? {
+    private struct ToolCallExtraction {
+        var call: ToolCall?
+        var malformed: String?
+        var inferredQuery: String?
+    }
+
+    private func extractToolCall(from text: String) -> ToolCallExtraction {
         let trimmedAccum = streamedToolCallAccum.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmedAccum.isEmpty {
-            if let obj = decodeToolCall(from: trimmedAccum) { return obj }
-        }
-        // Prefer explicit tag
+        var candidates: [String] = []
+        if !trimmedAccum.isEmpty { candidates.append(trimmedAccum) }
         if let r = text.range(of: #"<tool_call>([\s\S]*?)</tool_call>"#, options: .regularExpression) {
             let body = String(text[r])
                 .replacingOccurrences(of: "<tool_call>", with: "")
                 .replacingOccurrences(of: "</tool_call>", with: "")
-            if let obj = decodeToolCall(from: body) { return obj }
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !body.isEmpty { candidates.append(body) }
         }
-        return nil
+        for raw in candidates {
+            if let obj = decodeToolCall(from: raw) {
+                return ToolCallExtraction(call: obj, malformed: nil, inferredQuery: nil)
+            }
+        }
+        if let raw = candidates.last {
+            let inferred = captureQuery(from: raw)
+            return ToolCallExtraction(call: nil, malformed: raw, inferredQuery: inferred)
+        }
+        return ToolCallExtraction(call: nil, malformed: nil, inferredQuery: nil)
     }
 
     private func decodeToolCall(from raw: String) -> ToolCall? {
-        // Strict JSON first
-        if let d = raw.data(using: .utf8), let obj = try? JSONDecoder().decode(ToolCall.self, from: d) { return obj }
-        // Lenient normalization: single quotes, trailing commas, camelCase keys
-        var s = raw
-        s = s.replacingOccurrences(of: #"'"#, with: "\"")
-        s = s.replacingOccurrences(of: "\"previewChars\"", with: "\"preview_chars\"")
-        s = s.replacingOccurrences(of: #",\s*([}\]])"#, with: "$1", options: .regularExpression)
-        if let d2 = s.data(using: .utf8), let obj2 = try? JSONDecoder().decode(ToolCall.self, from: d2) { return obj2 }
-        // Minimal regex to salvage query (required)
-        func captureQuery(_ str: String) -> String? {
-            if let r = str.range(of: #"\"query\"\s*:\s*\"([^\"]{1,512})\""#, options: .regularExpression) {
-                let match = String(str[r])
-                if let qStart = match.firstIndex(of: "\"") {
-                    let tail = match[match.index(after: qStart)...]
-                    if let qEnd = tail.firstIndex(of: "\"") { return String(tail[..<qEnd]) }
-                }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        if let data = trimmed.data(using: .utf8) {
+            let decoder = JSONDecoder()
+            if let obj = try? decoder.decode(ToolCall.self, from: data) {
+                return obj
             }
-            if let r2 = str.range(of: #"'query'\s*:\s*'([^']{1,512})'"#, options: .regularExpression) {
-                let match = String(str[r2])
-                if let qStart = match.firstIndex(of: "'") {
-                    let tail = match[match.index(after: qStart)...]
-                    if let qEnd = tail.firstIndex(of: "'") { return String(tail[..<qEnd]) }
-                }
+        }
+
+        var normalized = trimmed
+        normalized = normalized.replacingOccurrences(of: #"'"#, with: "\"")
+        normalized = normalized.replacingOccurrences(of: "\"topK\"", with: "\"top_k\"")
+        normalized = normalized.replacingOccurrences(of: "\"TopK\"", with: "\"top_k\"")
+        normalized = normalized.replacingOccurrences(of: "\"k\"", with: "\"top_k\"")
+        normalized = normalized.replacingOccurrences(of: #",\s*([}\]])"#, with: "$1", options: .regularExpression)
+        if let data = normalized.data(using: .utf8) {
+            let decoder = JSONDecoder()
+            if let obj = try? decoder.decode(ToolCall.self, from: data) {
+                return obj
             }
+        }
+
+        guard let query = captureQuery(from: normalized) else { return nil }
+        if let toolName = captureToolName(from: normalized), toolName.lowercased() != "web_search" {
             return nil
         }
-        if let q = captureQuery(raw) {
-            var kVal: Int? = nil
-            if let kr = raw.range(of: #"\"k\"\s*:\s*([0-9]{1,3})"#, options: .regularExpression) {
-                let frag = String(raw[kr])
-                if let n = Int(frag.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()) { kVal = n }
+        let topK = captureTopK(from: normalized)
+        return ToolCall(tool: "web_search", args: .init(query: query, topK: topK))
+    }
+
+    private func captureToolName(from raw: String) -> String? {
+        if let r = raw.range(of: #"\"tool\"\s*:\s*\"([^\"]{1,128})\""#, options: .regularExpression) {
+            let match = String(raw[r])
+            if let first = match.firstIndex(of: "\"") {
+                let tail = match[match.index(after: first)...]
+                if let end = tail.firstIndex(of: "\"") { return String(tail[..<end]) }
             }
-            var pcVal: Int? = nil
-            if let pr = raw.range(of: #"(preview_chars|previewChars)\"?\s*:\s*([0-9]{2,5})"#, options: .regularExpression) {
-                let frag = String(raw[pr])
-                if let n = Int(frag.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()) { pcVal = n }
+        }
+        if let r = raw.range(of: #"'tool'\s*:\s*'([^']{1,128})'"#, options: .regularExpression) {
+            let match = String(raw[r])
+            if let first = match.firstIndex(of: "'") {
+                let tail = match[match.index(after: first)...]
+                if let end = tail.firstIndex(of: "'") { return String(tail[..<end]) }
             }
-            return ToolCall(tool: "web_search", args: .init(query: q, k: kVal, summarize: nil, preview_chars: pcVal))
         }
         return nil
     }
 
-    private func makeToolCallFromUser(history: [ChatMessage]) -> ToolCall? {
-        guard let lastUser = history.last(where: { $0.role == .user }) else { return nil }
-        let q = lastUser.text
-        let hints = ["latest", "today", "news", "price", "spec", "release", "who is", "define", "error", "how to"]
-        let asked = hints.contains { q.lowercased().contains($0) }
-        if asked {
-            return ToolCall(tool: "web_search", args: .init(query: q, k: 5, summarize: true, preview_chars: 2000))
+    private func captureQuery(from raw: String) -> String? {
+        if let r = raw.range(of: #"\"query\"\s*:\s*\"([^\"]{1,512})\""#, options: .regularExpression) {
+            let match = String(raw[r])
+            if let first = match.firstIndex(of: "\"") {
+                let tail = match[match.index(after: first)...]
+                if let end = tail.firstIndex(of: "\"") { return String(tail[..<end]) }
+            }
+        }
+        if let r = raw.range(of: #"'query'\s*:\s*'([^']{1,512})'"#, options: .regularExpression) {
+            let match = String(raw[r])
+            if let first = match.firstIndex(of: "'") {
+                let tail = match[match.index(after: first)...]
+                if let end = tail.firstIndex(of: "'") { return String(tail[..<end]) }
+            }
         }
         return nil
+    }
+
+    private func captureTopK(from raw: String) -> Int? {
+        let patterns = [
+            #"top_k\"?\s*:\s*([0-9]{1,3})"#,
+            #"topK\"?\s*:\s*([0-9]{1,3})"#,
+            #"\bk\b\s*:\s*([0-9]{1,3})"#
+        ]
+        for pattern in patterns {
+            if let r = raw.range(of: pattern, options: .regularExpression) {
+                let frag = String(raw[r])
+                let digits = frag.components(separatedBy: CharacterSet.decimalDigits.inverted).joined()
+                if let value = Int(digits) { return value }
+            }
+        }
+        return nil
+    }
+
+    private func fallbackQuery(from history: [ChatMessage]) -> String {
+        guard let last = history.last(where: { $0.role == .user }) else { return "" }
+        return last.text
+    }
+
+    private func normalizeQueryHint(_ raw: String) -> String {
+        let collapsed = raw.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        let trimmed = collapsed.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "USER_QUERY_HERE" }
+        return String(trimmed.prefix(256))
+    }
+
+    private func canonicalToolCallJSON(query: String, topK: Int) -> String {
+        let call = ToolCall(tool: "web_search", args: .init(query: query, topK: topK))
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+        if let data = try? encoder.encode(call), let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+        return "{\"tool\":\"web_search\",\"args\":{\"query\":\"\(query)\",\"top_k\":\(topK)}}"
+    }
+
+    private func encodeMalformedToolResult(received: String, canonical: String) -> String {
+        struct Payload: Codable {
+            var ok: Bool
+            var error: String
+            var received: String
+            var expected_format: String
+            var instruction: String
+            var needs_retry: Bool
+        }
+        let trimmedReceived = String(received.trimmingCharacters(in: .whitespacesAndNewlines).prefix(600))
+        let payload = Payload(
+            ok: false,
+            error: "web_search tool call JSON malformed",
+            received: trimmedReceived,
+            expected_format: canonical,
+            instruction: "Resend the tool_call as valid JSON exactly matching expected_format.",
+            needs_retry: true
+        )
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+        if let data = try? encoder.encode(payload), let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+        return "{\"ok\":false,\"error\":\"web_search tool call JSON malformed\",\"expected_format\":\"\(canonical)\",\"instruction\":\"Resend the tool_call as valid JSON exactly matching expected_format.\",\"needs_retry\":true}"
     }
 
     private func cleanVisible(_ raw: String) -> String {
@@ -674,6 +781,87 @@ final class LLMRunner: ObservableObject {
             debug: payload.debug
         )
         return encode(minimal)
+    }
+
+    private func encodeSearchFailureResult(
+        query: String,
+        topK: Int,
+        errorDescription: String,
+        stage: String?,
+        debug: [String]
+    ) -> String {
+        struct FailurePayload: Codable {
+            var ok: Bool = false
+            var query: String
+            var expected_top_k: Int
+            var source: String = "error"
+            var error: String
+            var stage: String?
+            var results: [WSEngineResult] = []
+            var previews: [String] = []
+            var summaries: [String] = []
+            var summarized: Bool = false
+            var instruction: String
+            var debug: [String: String]?
+        }
+        let trace = compactDebug(debug)
+        var payload = FailurePayload(
+            query: query,
+            expected_top_k: topK,
+            error: errorDescription,
+            stage: stage,
+            instruction: "Continue the answer without web citations."
+        )
+        if !trace.isEmpty {
+            payload.debug = ["trace": trace]
+        }
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+        if let data = try? encoder.encode(payload), let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+        return "{\"ok\":false,\"query\":\"\(query)\",\"error\":\"\(errorDescription)\",\"source\":\"error\"}"
+    }
+
+    private func fallbackVisibleForSearchFailure(context: SearchFailureContext, prefs: AppPrefs) -> String {
+        var sections: [String] = []
+        sections.append("I couldn’t retrieve live web results for “\(context.query)”.")
+        if let stage = context.stage, !stage.isEmpty {
+            sections.append("The search failed during \(stage) with error: \(context.errorDescription).")
+        } else {
+            sections.append("The search error was: \(context.errorDescription).")
+        }
+        if prefs.showDetailedErrors {
+            let trace = compactDebug(context.debugLines)
+            if !trace.isEmpty {
+                sections.append("Search debug trace: \(trace)")
+            }
+        }
+        sections.append("I’ll continue without web citations this time.")
+        return Sanitizer.sanitizeLLM(sections.joined(separator: "\n\n"))
+    }
+
+    private func appendSearchDebug(_ line: String) {
+        let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if searchDebugLog.count >= 40 {
+            searchDebugLog.removeFirst(searchDebugLog.count - 39)
+        }
+        searchDebugLog.append(trimmed)
+    }
+
+    private func compactSearchDebugLog() -> String {
+        return compactDebug(searchDebugLog)
+    }
+
+    private func compactDebug(_ lines: [String]) -> String {
+        guard !lines.isEmpty else { return "" }
+        var trimmed = lines
+        while trimmed.count > 1 && trimmed.joined(separator: " | ").count > 900 {
+            trimmed.removeFirst()
+        }
+        let joined = trimmed.joined(separator: " | ")
+        if joined.count <= 900 { return joined }
+        return String(joined.suffix(900))
     }
 
     private func samplingTemp(for effort: ReasoningEffort) -> String {

@@ -12,6 +12,38 @@ enum SearchProgress {
     case status(String)
 }
 
+enum SearchPipelineError: LocalizedError {
+    case stage(name: String, underlying: Error)
+    case noResults(query: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .stage(let name, let underlying):
+            let detail = underlying.localizedDescription
+            if detail.isEmpty {
+                return "Search failed during \(name)."
+            }
+            return "Search failed during \(name): \(detail)"
+        case .noResults(let query):
+            return "No search results were returned for \"\(query)\"."
+        }
+    }
+
+    var stageName: String {
+        switch self {
+        case .stage(let name, _): return name
+        case .noResults: return "results"
+        }
+    }
+
+    var underlyingError: Error? {
+        switch self {
+        case .stage(_, let underlying): return underlying
+        case .noResults: return nil
+        }
+    }
+}
+
 final class WebSearchService {
     static let shared = WebSearchService()
     private init() {
@@ -25,9 +57,7 @@ final class WebSearchService {
 
     func web_search(
         query: String,
-        k: Int = 5,
-        summarize: Bool = true,
-        previewChars: Int = 2000,
+        topK: Int = 5,
         progress: @escaping (SearchProgress) -> Void,
         completion: @escaping (Result<WSPayload, Error>) -> Void
     ) {
@@ -36,13 +66,21 @@ final class WebSearchService {
             do {
                 progress(.status("Planning query…"))
                 // Clamp inputs to keep downstream prompts within budget
-                let cappedK = max(1, min(5, k))
+                let cappedK = max(1, min(5, topK))
+                let previewChars = 2000
+                let summarize = true
                 let cappedPreview = max(200, min(1500, previewChars))
                 // Engine cascade
                 var candidates: [WSEngineResult] = []
 
                 // 1) DuckDuckGo HTML
-                let ddg = try await self.searchDDGHTML(query: query, take: max(10, cappedK * 2))
+                let ddg: [WSEngineResult]
+                do {
+                    ddg = try await self.searchDDGHTML(query: query, take: max(10, cappedK * 2))
+                } catch {
+                    progress(.status("DuckDuckGo HTML stage failed: \(error.localizedDescription)"))
+                    throw SearchPipelineError.stage(name: "duckduckgo_html", underlying: error)
+                }
                 candidates.append(contentsOf: ddg)
 
                 // TODO: add Bing HTML fallback if DDG thin; for now, DDG usually suffices.
@@ -51,8 +89,14 @@ final class WebSearchService {
                 let deduped = self.dedupe(candidates)
 
                 // Rank
+                progress(.status("Ranking results…"))
                 let ranked = self.rank(query: query, results: deduped)
                 let top = Array(ranked.prefix(cappedK))
+                guard !top.isEmpty else {
+                    progress(.status("No search results after ranking."))
+                    throw SearchPipelineError.noResults(query: query)
+                }
+                progress(.status("Selected \(top.count) results."))
 
                 progress(.status("Fetching previews…"))
                 // Fetch previews + MLX summaries
@@ -90,11 +134,13 @@ final class WebSearchService {
                         }
                     } catch {
                         // Skip individual preview failures; continue
+                        progress(.status("Preview fetch failed for \(r.host): \(error.localizedDescription)"))
                         continue
                     }
                 }
 
                 let sourceEngine = top.first?.engine ?? "ddg_html"
+                progress(.status("Summaries ready."))
                 let payload = WSPayload(
                     ok: true,
                     query: query,
@@ -105,11 +151,21 @@ final class WebSearchService {
                     recommendedOpen: recommended,
                     queryHints: self.hints(for: query),
                     summarized: summarize,
-                    debug: ["engine": sourceEngine]
+                    debug: [
+                        "engine": sourceEngine,
+                        "results_count": "\(top.count)",
+                        "summaries": summarize ? "true" : "false"
+                    ]
                 )
                 completion(.success(payload))
             } catch {
-                completion(.failure(error))
+                if let pipelineError = error as? SearchPipelineError {
+                    completion(.failure(pipelineError))
+                } else if let wsError = error as? WSError {
+                    completion(.failure(SearchPipelineError.stage(name: "pipeline", underlying: wsError)))
+                } else {
+                    completion(.failure(SearchPipelineError.stage(name: "pipeline", underlying: error)))
+                }
             }
         }
     }
@@ -218,7 +274,13 @@ final class WebSearchService {
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         req.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
         req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let dataResp: (Data, URLResponse)
+        do {
+            dataResp = try await URLSession.shared.data(for: req)
+        } catch {
+            throw WSError.transport(error)
+        }
+        let (data, resp) = dataResp
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
             throw WSError.httpStatus(url: url.absoluteString, code: http.statusCode)
         }
