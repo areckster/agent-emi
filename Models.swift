@@ -93,6 +93,7 @@ struct WSPayload: Codable {
     var queryHints: [String]
     var summarized: Bool
     var debug: [String: String]?
+    var error: String?
 }
 
 // Tool call decode
