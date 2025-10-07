@@ -22,6 +22,7 @@ enum Sanitizer {
             try! NSRegularExpression(pattern: "(?i)^When current information is needed.*$", options: [.anchorsMatchLines]),
             try! NSRegularExpression(pattern: "(?i)^Wait for <tool_result.*$", options: [.anchorsMatchLines]),
             try! NSRegularExpression(pattern: "(?i)^Use web_search for anything.*$", options: [.anchorsMatchLines]),
+            try! NSRegularExpression(pattern: "(?i)^Only include \"query\" and optional \"top_k\".*$", options: [.anchorsMatchLines]),
             try! NSRegularExpression(pattern: "(?i)^\\[\\[policy.*\\]\\]$", options: [.anchorsMatchLines])
         ]
     }()

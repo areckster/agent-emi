@@ -25,9 +25,7 @@ final class WebSearchService {
 
     func web_search(
         query: String,
-        k: Int = 5,
-        summarize: Bool = true,
-        previewChars: Int = 2000,
+        topK: Int = 5,
         progress: @escaping (SearchProgress) -> Void,
         completion: @escaping (Result<WSPayload, Error>) -> Void
     ) {
@@ -36,7 +34,9 @@ final class WebSearchService {
             do {
                 progress(.status("Planning query…"))
                 // Clamp inputs to keep downstream prompts within budget
-                let cappedK = max(1, min(5, k))
+                let cappedK = max(1, min(5, topK))
+                let previewChars = 2000
+                let summarize = true
                 let cappedPreview = max(200, min(1500, previewChars))
                 // Engine cascade
                 var candidates: [WSEngineResult] = []
