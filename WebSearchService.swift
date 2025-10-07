@@ -31,30 +31,52 @@ final class WebSearchService {
     ) {
         Task.detached {
             let engine = await MainActor.run { self.summarizerEngine }
+            var stage = "planning"
+            var debug: [String: String] = [
+                "query": query,
+                "requested_top_k": String(topK)
+            ]
             do {
                 progress(.status("Planning query…"))
                 // Clamp inputs to keep downstream prompts within budget
                 let cappedK = max(1, min(5, topK))
+                debug["capped_top_k"] = String(cappedK)
                 let previewChars = 2000
                 let summarize = true
                 let cappedPreview = max(200, min(1500, previewChars))
+                debug["preview_chars"] = String(cappedPreview)
+                debug["summarizer"] = engine == nil ? "naive" : "mlx"
                 // Engine cascade
                 var candidates: [WSEngineResult] = []
 
                 // 1) DuckDuckGo HTML
+                stage = "ddg_html"
                 let ddg = try await self.searchDDGHTML(query: query, take: max(10, cappedK * 2))
+                debug["ddg_html_candidates"] = String(ddg.count)
                 candidates.append(contentsOf: ddg)
 
                 // TODO: add Bing HTML fallback if DDG thin; for now, DDG usually suffices.
 
                 // Deduplicate by URL/title
+                stage = "dedupe"
                 let deduped = self.dedupe(candidates)
+                debug["deduped_count"] = String(deduped.count)
 
                 // Rank
+                stage = "rank"
                 let ranked = self.rank(query: query, results: deduped)
                 let top = Array(ranked.prefix(cappedK))
+                debug["top_count"] = String(top.count)
+                let engineBreakdown = Dictionary(grouping: candidates, by: { $0.engine }).mapValues { $0.count }
+                if !engineBreakdown.isEmpty {
+                    debug["engine_breakdown"] = engineBreakdown.map { "\($0.key)=\($0.value)" }.sorted().joined(separator: ",")
+                    if engineBreakdown.keys.contains("ddg_lite") {
+                        progress(.status("DuckDuckGo lite fallback in use…"))
+                    }
+                }
 
                 progress(.status("Fetching previews…"))
+                stage = "previews"
                 // Fetch previews + MLX summaries
                 var previews: [String] = []
                 var summaries: [String] = []
@@ -62,7 +84,9 @@ final class WebSearchService {
                 var bestScore = -Double.infinity
                 // Larger text for summarizer input; keep preview short
                 let summarizerChars = min(10000, max(2000, cappedPreview * 6))
+                debug["summarizer_chars"] = String(summarizerChars)
                 var idx = 0
+                var previewFailures: [String] = []
                 for r in top {
                     do {
                         idx += 1
@@ -77,24 +101,37 @@ final class WebSearchService {
                                 if let engine = engine {
                                     progress(.status("Summarizing (\(idx)/\(top.count))…"))
                                     do {
+                                        stage = "summarize"
                                         sum = try await engine.summarize(query: query, title: safeTitle, host: r.host, content: longText)
                                     } catch {
+                                        stage = "summarize_fallback"
+                                        debug["summarizer_fallback"] = "true"
                                         sum = self.naiveSummarize(title: safeTitle, host: r.host, text: longText)
                                     }
                                 } else {
                                     sum = self.naiveSummarize(title: safeTitle, host: r.host, text: longText)
                                 }
                                 summaries.append(sum)
+                                stage = "previews"
                             }
                             if r.score > bestScore { bestScore = r.score; recommended = r }
                         }
                     } catch {
-                        // Skip individual preview failures; continue
+                        previewFailures.append(self.shortErrorDescription(error))
                         continue
                     }
                 }
+                debug["preview_success_count"] = String(previews.count)
+                if !previewFailures.isEmpty {
+                    let joined = previewFailures.joined(separator: " | ")
+                    debug["preview_failures"] = String(joined.prefix(400))
+                }
+                debug["summary_count"] = String(summaries.count)
 
                 let sourceEngine = top.first?.engine ?? "ddg_html"
+                debug["final_engine"] = sourceEngine
+                stage = "complete"
+                debug["final_stage_label"] = friendlyStageName(stage)
                 let payload = WSPayload(
                     ok: true,
                     query: query,
@@ -105,11 +142,16 @@ final class WebSearchService {
                     recommendedOpen: recommended,
                     queryHints: self.hints(for: query),
                     summarized: summarize,
-                    debug: ["engine": sourceEngine]
+                    debug: debug,
+                    error: nil
                 )
                 completion(.success(payload))
             } catch {
-                completion(.failure(error))
+                debug["stage"] = stage
+                let wrappedError = self.wrapSearchError(query: query, stage: stage, underlying: error, debug: debug)
+                let friendlyStage = friendlyStageName(stage)
+                progress(.status("Search error during \(friendlyStage): \(wrappedError.localizedDescription)"))
+                completion(.failure(wrappedError))
             }
         }
     }
@@ -218,7 +260,13 @@ final class WebSearchService {
         req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         req.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
         req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
-        let (data, resp) = try await URLSession.shared.data(for: req)
+        let data: Data
+        let resp: URLResponse
+        do {
+            (data, resp) = try await URLSession.shared.data(for: req)
+        } catch {
+            throw WSError.transport(error)
+        }
         if let http = resp as? HTTPURLResponse, http.statusCode != 200 {
             throw WSError.httpStatus(url: url.absoluteString, code: http.statusCode)
         }
@@ -291,12 +339,98 @@ enum WSError: LocalizedError {
     case httpStatus(url: String, code: Int)
     case transport(Error)
     case parsing(String)
+
     var errorDescription: String? {
         switch self {
         case .httpStatus(let url, let code): return "HTTP \(code) while fetching \(url)"
         case .transport(let err): return "Network error: \(err.localizedDescription)"
         case .parsing(let msg): return "Parse error: \(msg)"
         }
+    }
+
+    var debugInfo: [String: String] {
+        switch self {
+        case .httpStatus(let url, let code):
+            return ["type": "http_status", "url": url, "status_code": String(code)]
+        case .transport(let err):
+            let ns = err as NSError
+            var info: [String: String] = [
+                "type": "transport",
+                "error_domain": ns.domain,
+                "error_code": String(ns.code)
+            ]
+            let desc = ns.localizedDescription
+            if !desc.isEmpty { info["error_description"] = desc }
+            return info
+        case .parsing(let msg):
+            return ["type": "parsing", "message": msg]
+        }
+    }
+}
+
+struct WebSearchError: LocalizedError {
+    let query: String
+    let stage: String
+    let underlying: Error
+    let debug: [String: String]
+
+    var errorDescription: String? {
+        let base = underlying.localizedDescription.isEmpty ? String(describing: underlying) : underlying.localizedDescription
+        let friendlyStage = friendlyStageName(stage)
+        return "\(friendlyStage): \(base)"
+    }
+
+    var failureReason: String? {
+        let friendlyStage = friendlyStageName(stage)
+        return "Failure during \(friendlyStage) stage for query \(query)"
+    }
+
+    var recoverySuggestion: String? {
+        "Retry shortly or adjust the query."
+    }
+}
+
+private extension WebSearchService {
+    func wrapSearchError(query: String, stage: String, underlying: Error, debug: [String: String]) -> WebSearchError {
+        var mergedDebug = debug
+        if let ws = underlying as? WSError {
+            mergedDebug.merge(ws.debugInfo) { current, _ in current }
+        } else {
+            let ns = underlying as NSError
+            mergedDebug["error_domain"] = ns.domain
+            mergedDebug["error_code"] = String(ns.code)
+            let desc = ns.localizedDescription
+            if !desc.isEmpty {
+                mergedDebug["error_description"] = desc
+            }
+        }
+        mergedDebug["failure_stage"] = stage
+        mergedDebug["failure_stage_label"] = friendlyStageName(stage)
+        return WebSearchError(query: query, stage: stage, underlying: underlying, debug: mergedDebug)
+    }
+
+    func shortErrorDescription(_ error: Error) -> String {
+        if let ws = error as? WSError {
+            return ws.errorDescription ?? String(describing: ws)
+        }
+        let ns = error as NSError
+        let message = ns.localizedDescription
+        if !message.isEmpty { return message }
+        return String(describing: type(of: error))
+    }
+}
+
+private func friendlyStageName(_ stage: String) -> String {
+    switch stage {
+    case "planning": return "query planning"
+    case "ddg_html": return "DuckDuckGo HTML search"
+    case "dedupe": return "result deduplication"
+    case "rank": return "result ranking"
+    case "previews": return "preview fetching"
+    case "summarize": return "content summarization"
+    case "summarize_fallback": return "summarization fallback"
+    case "complete": return "result assembly"
+    default: return stage.replacingOccurrences(of: "_", with: " ")
     }
 }
 

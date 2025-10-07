@@ -83,6 +83,7 @@ final class LLMRunner: ObservableObject {
         self.thinkEndedAt = nil
         self.visitedSites.removeAll()
         self.statusLine = "Thinking…"
+        self.lastError = nil
         self.streamedToolCallAccum = ""
         self.didPruneUserEcho = false
         self.isSearching = false
@@ -151,27 +152,25 @@ final class LLMRunner: ObservableObject {
                                     self.finish(.failure(RunnerError.processFailed("Cancelled")), prefs: prefs, completion: completion)
                                     return
                                 }
-                                switch wsResult {
-                                case .failure(let err):
-                                    onEvent(.toolFinished("web_search"))
-                                    self.statusLine = "Search failed"
-                                    self.isSearching = false
-                                    let msg: String
-                                    if prefs.showDetailedErrors {
-                                        msg = "Web search failed for query \"\(tool.args.query)\" (DuckDuckGo). Details: \(err.localizedDescription). Tips: check your internet connection or try again shortly. The assistant will continue without sources."
-                                    } else {
-                                        msg = "Web search failed. Continuing without sources."
-                                    }
-                                    self.lastError = msg
-                                    self.visibleStreamRaw = ""; self.streamingVisible = ""; self.streamedToolCallAccum = ""
-                                    let callJSON = self.canonicalToolCallJSON(query: tool.args.query, topK: topK)
-                                    let extendedRaw = trimmed + [
-                                        ChatMessage(role: .assistant, text: "<tool_call>\(callJSON)</tool_call>"),
-                                        ChatMessage(role: .assistant, text: "<tool_result name=\"web_search\">{\"ok\":false,\"query\":\"\(tool.args.query)\",\"source\":\"error\",\"results\":[],\"previews\":[],\"summaries\":[],\"summarized\":false}</tool_result>")
-                                    ]
-                                    let extended = self.trimHistoryToBudget(prefs: prefs, reasoning: prefs.reasoningEffort, toolSpec: self.toolSpec, history: extendedRaw)
-                                    self.secondPass(prefs: prefs, extendedHistory: extended, onEvent: onEvent, completion: completion)
-                                case .success(let payload):
+                switch wsResult {
+                case .failure(let err):
+                    onEvent(.toolFinished("web_search"))
+                    let status = self.searchStatusText(for: err, query: tool.args.query)
+                    self.statusLine = status
+                    onEvent(.status(status))
+                    self.isSearching = false
+                    let banner = self.searchErrorBanner(for: err, query: tool.args.query, prefs: prefs)
+                    self.updateLastError(with: banner)
+                    self.visibleStreamRaw = ""; self.streamingVisible = ""; self.streamedToolCallAccum = ""
+                    let callJSON = self.canonicalToolCallJSON(query: tool.args.query, topK: topK)
+                    let failurePayload = self.encodeSearchFailurePayload(query: tool.args.query, topK: topK, error: err)
+                    let extendedRaw = trimmed + [
+                        ChatMessage(role: .assistant, text: "<tool_call>\(callJSON)</tool_call>"),
+                        ChatMessage(role: .assistant, text: "<tool_result name=\"web_search\">\(failurePayload)</tool_result>")
+                    ]
+                    let extended = self.trimHistoryToBudget(prefs: prefs, reasoning: prefs.reasoningEffort, toolSpec: self.toolSpec, history: extendedRaw)
+                    self.secondPass(prefs: prefs, extendedHistory: extended, onEvent: onEvent, completion: completion)
+                case .success(let payload):
                                     onEvent(.toolFinished("web_search"))
                                     self.isSearching = false
                                     self.usedSearchThisAnswer = true
@@ -261,7 +260,13 @@ final class LLMRunner: ObservableObject {
     private func finish(_ result: Result<String, Error>, prefs: AppPrefs, completion: (Result<String, Error>) -> Void) {
         if case .failure(let e) = result {
             let message = userFacingErrorMessage(from: e, prefs: prefs)
-            self.lastError = message
+            if let current = lastError,
+               current.lowercased().contains("web search failed"),
+               message == RunnerError.outputEmpty.localizedDescription {
+                // Preserve the more actionable search failure message.
+            } else {
+                updateLastError(with: message)
+            }
             // UI manages dismissal timing (hover-aware)
         }
         // Ensure visible output is tidy and no dangling buffers remain
@@ -680,6 +685,84 @@ final class LLMRunner: ObservableObject {
         Sanitizer.sanitizeLLM(raw)
     }
 
+    private func searchStatusText(for error: Error, query: String) -> String {
+        let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if detail.isEmpty {
+            return "Search failed for \(query)"
+        }
+        if detail.lowercased().hasPrefix("search failed") {
+            return detail
+        }
+        return "Search failed: \(detail)"
+    }
+
+    private func searchErrorBanner(for error: Error, query: String, prefs: AppPrefs) -> String {
+        if !prefs.showDetailedErrors {
+            if let stageText = stageDescription(for: error) {
+                return "Web search failed during \(stageText). The assistant will continue without live sources."
+            }
+            return "Web search failed. The assistant will continue without live sources."
+        }
+        let stageText = stageDescription(for: error)
+        let detail = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        var pieces: [String] = []
+        var base = "Web search failed for query \"\(query)\""
+        if let stageText {
+            base += " during \(stageText)"
+        }
+        pieces.append(base)
+        if !detail.isEmpty {
+            pieces.append("Details: \(detail)")
+        }
+        pieces.append("Tips: check your internet connection, wait a few seconds, or adjust the query. The assistant will continue without live sources.")
+        return pieces.joined(separator: " ")
+    }
+
+    private func stageDescription(for error: Error) -> String? {
+        if let searchError = error as? WebSearchError {
+            switch searchError.stage {
+            case "planning": return "query planning"
+            case "ddg_html": return "DuckDuckGo HTML search"
+            case "dedupe": return "result deduplication"
+            case "rank": return "result ranking"
+            case "previews": return "preview fetching"
+            case "summarize": return "content summarization"
+            case "summarize_fallback": return "summarization fallback"
+            case "complete": return "result assembly"
+            default: return searchError.stage.replacingOccurrences(of: "_", with: " ")
+            }
+        }
+        if let ws = error as? WSError {
+            switch ws {
+            case .httpStatus: return "HTTP fetch"
+            case .transport: return "network request"
+            case .parsing: return "parsing"
+            }
+        }
+        return nil
+    }
+
+    private func searchDebugInfo(from error: Error, query: String, topK: Int) -> [String: String] {
+        var info: [String: String] = [
+            "query": query,
+            "top_k": String(topK)
+        ]
+        if let searchError = error as? WebSearchError {
+            info.merge(searchError.debug) { current, _ in current }
+        } else if let ws = error as? WSError {
+            info.merge(ws.debugInfo) { current, _ in current }
+        } else {
+            let ns = error as NSError
+            info["error_domain"] = ns.domain
+            info["error_code"] = String(ns.code)
+            let desc = ns.localizedDescription
+            if !desc.isEmpty {
+                info["error_description"] = desc
+            }
+        }
+        return info
+    }
+
     private func encodeSearchPayloadCompacted(_ p: WSPayload) -> String {
         func encode(_ payload: WSPayload) -> String {
             let enc = JSONEncoder(); enc.outputFormatting = [.withoutEscapingSlashes]
@@ -720,9 +803,56 @@ final class LLMRunner: ObservableObject {
             recommendedOpen: payload.recommendedOpen,
             queryHints: Array(payload.queryHints.prefix(2)),
             summarized: payload.summarized,
-            debug: payload.debug
+            debug: payload.debug,
+            error: payload.error
         )
         return encode(minimal)
+    }
+
+    private func encodeSearchFailurePayload(query: String, topK: Int, error: Error) -> String {
+        struct FailurePayload: Codable {
+            var ok: Bool
+            var query: String
+            var source: String
+            var error: String
+            var debug: [String: String]
+            var fallback: String
+            var tips: [String]
+            var stage: String?
+        }
+
+        let message = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        let debug = searchDebugInfo(from: error, query: query, topK: topK)
+        let payload = FailurePayload(
+            ok: false,
+            query: query,
+            source: "error",
+            error: message.isEmpty ? "Search failed without further detail." : message,
+            debug: debug,
+            fallback: "Respond using existing knowledge; do not rely on live web sources.",
+            tips: [
+                "Check network connectivity.",
+                "Retry after waiting a few seconds.",
+                "Adjust the query wording if automated scraping was blocked."
+            ],
+            stage: stageDescription(for: error)
+        )
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.withoutEscapingSlashes]
+        if let data = try? encoder.encode(payload), let string = String(data: data, encoding: .utf8) {
+            return string
+        }
+        return "{\"ok\":false,\"source\":\"error\",\"error\":\"Search failed\"}"
+    }
+
+    private func updateLastError(with message: String) {
+        let trimmed = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        if let current = lastError, !current.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            if current.contains(trimmed) { return }
+            self.lastError = current + "\n" + trimmed
+        } else {
+            self.lastError = trimmed
+        }
     }
 
     private func samplingTemp(for effort: ReasoningEffort) -> String {
