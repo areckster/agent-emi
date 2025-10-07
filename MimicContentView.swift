@@ -144,7 +144,6 @@ struct MimicContentView: View {
         runner.generateWithToolsStreaming(
             prefs: prefs,
             history: history,
-            forceSearchIfUserAsked: text.lowercased().contains("search") || text.lowercased().contains("find "),
             onEvent: { _ in },
             completion: { result in
                 switch result {

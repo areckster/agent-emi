@@ -50,8 +50,9 @@ struct PromptTemplate {
         }
 
         sysLines.append("After </think>, deliver a refined response in natural prose — no headers like 'Final Answer' or 'Response:'. If summarizing, integrate it gracefully into your last sentence.")
-        sysLines.append("Tools available: web_search(query: string, k?: int=5, summarize?: bool=true, preview_chars?: int=2000).")
-        sysLines.append(#"You are not forced to do a web search every time the user interacts with you. When current information is needed or the user asks to search, output a single line: <tool_call>{"tool":"web_search","args":{"query":"...","k":5,"summarize":true,"preview_chars":2000}}</tool_call>"#)
+        sysLines.append("Tools available: web_search(query: string, top_k?: int=5).")
+        sysLines.append(#"You are not forced to do a web search every time the user interacts with you. When current information is needed or the user asks to search, output a single line: <tool_call>{"tool":"web_search","args":{"query":"...","top_k":5}}</tool_call>"#)
+        sysLines.append("Only include \"query\" and optional \"top_k\" in the args object—no other keys are allowed.")
         sysLines.append(#"Wait for <tool_result name=\"web_search\">{...}</tool_result> before continuing, then cite only those URLs. If no tool_result is available, do not invent or cite URLs, do not claim to have visited URLs, and do not add a 'Sources:' section."#)
 
         if !toolSpec.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
