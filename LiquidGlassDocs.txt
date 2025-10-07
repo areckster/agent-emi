@@ -1,0 +1,168 @@
+# Liquid Glass — Developer Briefing (macOS 26)
+
+**Purpose:**
+This document is a compact, engineering-focused reference describing how Liquid Glass works and how to integrate it into a macOS 26 (Tahoe) app. Feed this to a coding AI or an engineer who does not already know the macOS 26 APIs. It explains the design intent, API patterns, accessibility and performance constraints, and practical examples to implement and test.
+
+---
+
+## Executive summary
+
+* **Liquid Glass** is a dynamic, platform-wide material introduced in macOS 26. It simulates glass-like optical behaviors (translucency, refraction, adaptive tinting and reflection) while remaining interactive and performant.
+* Use Liquid Glass to create depth and focus: backgrounds, nav bars, controls, floating sheets, and subtle chrome. **Do not** overload the UI with excessive glass; it’s meant for hierarchy and emphasis.
+* Implementation is available as high-level SwiftUI modifiers and platform materials. The modifier approach is the recommended, forward-looking integration path for apps.
+
+---
+
+## Design principles & constraints
+
+* **Optical fidelity:** Liquid Glass samples and refracts content from behind it and adapts tint based on surrounding content. Expect subtle color shifts depending on context.
+* **Dynamic adaptation:** The material responds to motion, lighting, and layout changes. It will animate and reshape fluidly.
+* **Hierarchy, not decoration:** Use the material to emphasize important surfaces or controls — not as a blanket treatment.
+* **Accessibility-first:** Respect system accessibility settings (Reduce Transparency, Increase Contrast, Reduce Motion). Provide fallbacks.
+* **Performance-sensitive:** Glass effects can be GPU-intensive. Profile and degrade gracefully on lower-powered hardware.
+
+---
+
+## API surface (summary you can feed to a coding AI)
+
+* **High-level SwiftUI modifier:** `.glassEffect(...)` — apply to any `View` to wrap it with Liquid Glass behavior.
+
+  * **Usage pattern:** Apply the glass modifier **after** other appearance modifiers that affect the view contents (so the material samples the final visual). Example: `SomeView().background(...).glassEffect()`.
+  * **Options:** style variants (e.g., `.regular`, `.prominent`, `.subtle`), blur radius or strength, and an optional `in:` parameter to control sampling bounds.
+* **Material tokens / names:** There are named material tokens (e.g., `liquidGlass.primary`, `liquidGlass.toolbar`) to keep visuals consistent across the app.
+* **Composition rules:** Liquid Glass composes with opacity and blend modes. Avoid stacking multiple glass layers over the same content; flatten if possible.
+* **Platform availability checks:** Guard use with availability checks: `if #available(macOS 26, *) { /* apply glass */ } else { /* fallback */ }`.
+
+---
+
+## Practical SwiftUI examples (feed directly to a coder)
+
+**Minimal glass background**
+
+```swift
+if #available(macOS 26, *) {
+  VStack {
+    Text("Content")
+  }
+  .padding()
+  .background(.ultraThinMaterial) // or .liquidGlassPrimary
+  .glassEffect() // apply the modifier after background
+} else {
+  VStack { Text("Content") }.padding().background(Color(.windowBackgroundColor))
+}
+```
+
+**Glass toolbar**
+
+```swift
+if #available(macOS 26, *) {
+  HStack {
+    Button("Back") { }
+    Spacer()
+    Text("Title")
+  }
+  .padding(12)
+  .background(.liquidGlassToolbar)
+  .glassEffect(style: .prominent)
+}
+```
+
+**Custom view + glass sampling region**
+
+```swift
+if #available(macOS 26, *) {
+  ZStack {
+    Image("scene")
+      .resizable()
+      .scaledToFill()
+
+    VStack {
+      RoundedRectangle(cornerRadius: 12)
+        .frame(height: 120)
+        .glassEffect(in: .localBounds) // control sampling region
+    }
+  }
+}
+```
+
+---
+
+## Integration rules & best practices
+
+* **Apply modifier last:** Always apply the glass modifier after visual transforms so the material accurately samples final pixels.
+* **Limit live samples:** If a glass surface is static, consider snapshotting (render-to-texture) and using the snapshot instead of continuous sampling.
+* **Single-layer principle:** Avoid stacking many glass layers; flatten where possible to reduce GPU load.
+* **Use named tokens:** Pick platform material tokens for consistent look and automatic theme adaptation.
+* **Avoid small text over busy glass:** Small, thin typography over highly refractive glass reduces legibility — use a solid backdrop or increase contrast.
+
+---
+
+## Accessibility & system settings
+
+* **Respect user settings:** Detect and respect `Accessibility.reduceTransparency`, `Accessibility.increaseContrast`, and `Accessibility.reduceMotion`. Provide alternate non-glass styles when these settings are active.
+* **Contrast & legibility:** Ensure text over glass maintains at least WCAG AA contrast ratios (4.5:1 for body text). Prefer larger or bolder type if glass is used behind text.
+* **Motion:** For animated glass behavior, reduce or disable motion if `Reduce Motion` is on.
+* **Screen readers:** Glass is visual-only; ensure semantic labels and roles are present for assistive tech.
+
+---
+
+## Performance & profiling
+
+* **Profile early:** Test on a range of hardware — especially older Macs and integrated GPUs. Liquid Glass can be GPU-heavy when many live-sampled layers are present.
+* **Degrade gracefully:** Provide logic to switch to a static, translucent color or blur-only fallback on low-power devices or when thermal constraints appear.
+* **Rasterize static layers:** If a glass panel is static in position and content, pre-rasterize to reduce continuous sampling.
+* **Limit blur radius and sample region:** Higher blur and larger sampling areas increase cost; tune these values conservatively.
+
+---
+
+## Testing checklist
+
+* Build & run on macOS 26 SDK (Xcode 26 beta) and at least one device running macOS 26.
+* Test both light/dark system themes and dynamic theme changes.
+* Validate accessibility toggles: Reduce Transparency, Increase Contrast, Reduce Motion.
+* Test performance scenarios: many glass panels visible, rapid layout changes, and large images under glass.
+* Test fallback on older OS versions and ensure behavior matches spec.
+
+---
+
+## Fallback patterns
+
+* **Solid color fallback:** Use a semitransparent neutral color (`Color(.windowBackgroundColor).opacity(0.9)`) when unavailable.
+* **Blur-only fallback:** If refraction sampling is expensive/unavailable, use a simple blur with a stable tint.
+* **Feature-flag toggles:** Provide runtime flags so QA/devs can force glass-on or glass-off for testing.
+
+---
+
+## Common pitfalls & troubleshooting
+
+* **Glass sampling empty or black:** Ensure the glass modifier is applied after the view is rendered and that the sampling region includes background content. Verify z-ordering.
+* **Unreadable microcopy:** If small text is placed directly over glass, increase contrast or add a subtle solid backdrop.
+* **High GPU/thermal usage:** Reduce glass layer count, lower blur radius, snapshot static surfaces.
+* **Animations feel stuttery:** Profile UI thread and GPU usage. Consider disabling live sampling for animated scenes.
+
+---
+
+## Implementation checklist (developer-friendly)
+
+1. Install Xcode 26 beta and add macOS 26 SDK to the project.
+2. Audit surfaces and pick where glass adds hierarchy: toolbars, sheet chrome, modals, emphasized cards.
+3. Implement glass using the SwiftUI modifier; guard with availability checks.
+4. Add accessibility fallbacks and settings detection.
+5. Profile on target hardware; add graceful degradations.
+6. Add E2E tests for layout, accessibility toggles, and performance budgets.
+
+---
+
+## Recommended next steps for a coding AI
+
+1. Insert the `#available(macOS 26, *)` guards where glass is used.
+2. Apply `.glassEffect()` after final background/appearance modifiers.
+3. Add fallback styles for older systems and for accessibility preferences.
+4. Add a runtime toggle for QA: `forceGlass: Bool` to flip behavior quickly.
+5. Provide a small sample app demonstrating glass in a toolbar, a card, and a modal.
+
+---
+
+**End of briefing.**
+
+> Note: This brief is distilled from platform guidance and WWDC material. Use the platform documentation and WWDC session demos as the authoritative references while implementing.

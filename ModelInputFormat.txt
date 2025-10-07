@@ -1,0 +1,19 @@
+Here's the format for how to interact with the model:
+
+<|im_start|>system
+You are a helpful assistant
+
+
+Reasoning effort: low<|im_end|>
+<|im_start|>user
+Continue the fibonnaci sequence: 1, 1, 2, 3, 5, 8,<|im_end|>
+<|im_start|>assistant
+<think>
+Just continue: 13,21,34,...
+</think>
+The Fibonacci sequence continues by adding the two preceding numbers.
+After **8** the next term is **13** (1 + 8 = 9 – 1 = 8 + 5 = 13), then **21** (8 + 13 = 21), followed by **34** (13 + 21 = 34), and so on.
+
+So the sequence starts:
+
+**1, 1, 2, 3, 5, 8, 13, 21, 34, …**<|im_end|>
